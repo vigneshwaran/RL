@@ -906,6 +906,24 @@ def off_policy_distillation_train(
         eval_hook_period: How often (in steps) to call *eval_hook*. 0 = disabled.
         eval_hook_at_start: If True, call eval_hook before the first training step.
     """
+    # Phase 1 of cross-topology IPC supports different (TP, CP) between
+    # teacher and student but still requires equal data-parallel size:
+    # teacher's IPC handles are matched to student ranks by `dp_rank`, and
+    # mismatched dp_size means data shards have different sizes (no clean
+    # 1:1 mapping). Cross-DP routing is Phase 2 work; until it lands, fail
+    # loudly and early at the training entry point rather than mid-step in
+    # the worker selection helper.
+    student_dp_size = student_policy.sharding_annotations.get_axis_size("data_parallel")
+    teacher_dp_size = teacher_policy.sharding_annotations.get_axis_size("data_parallel")
+    assert student_dp_size == teacher_dp_size, (
+        f"off-policy distillation currently requires student and teacher to "
+        f"have the same data_parallel size, but got student dp_size="
+        f"{student_dp_size} and teacher dp_size={teacher_dp_size}. "
+        f"(TP and CP can differ — Phase 1 cross-topology IPC handles that. "
+        f"Different dp_size needs cross-DP batch routing, which is Phase 2 "
+        f"work and not yet implemented.)"
+    )
+
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config["checkpointing"].get("checkpoint_must_save_by", None),

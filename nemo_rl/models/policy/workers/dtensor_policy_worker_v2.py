@@ -708,102 +708,115 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         return on_microbatch_start
 
-    def _select_teacher_result_by_world_rank(
+    def _select_teacher_results_for_dp_group(
         self, teacher_logits: Any
-    ) -> dict[str, Any]:
-        """Select this worker's teacher result by matching global ``world_rank``.
+    ) -> dict[tuple[int, int], dict[str, Any]]:
+        """Return all teacher entries that share this student's ``dp_rank``.
 
-        The upstream ``teacher_logits`` container is an ordered list returned by
-        the teacher worker group. The previous implementation indexed it with
-        ``torch.distributed.get_rank()`` directly, which assumes teacher and
-        student worker-group layouts are identical. This helper replaces that
-        with explicit matching on the schema-v1 top-level ``world_rank`` field,
-        and validates required per-handle schema fields on the matched entry.
+        Phase 1 of cross-topology IPC: teacher and student may have different
+        (TP, CP) but must share ``dp_size`` so each student dp_rank corresponds
+        to exactly one teacher dp_rank's data slice. Within that slice, the
+        teacher produces ``teacher_tp_size * teacher_cp_size`` IPC records;
+        this helper collects all of them keyed by ``(t_tp_rank, t_cp_rank)``
+        so the student post-processor can reconstruct the full teacher
+        ``(B, S_full, V_full)`` tensor locally via IPC reads — without
+        participating in the teacher's process group.
+
+        Raises a clear error on dp_size mismatch (cross-DP routing is Phase 2)
+        or if the expected ``t_tp_size * t_cp_size`` entry count is incomplete.
         """
-        current_world_rank = torch.distributed.get_rank()
-        available_ranks: list[Any] = []
+        student_dp_group = self.dp_mesh.get_group()
+        student_dp_rank = torch.distributed.get_rank(student_dp_group)
+
+        # Discover teacher's parallel sizes from the first valid entry; all
+        # entries are produced by the same teacher worker group so these are
+        # uniform across the list.
+        teacher_dp_size: Optional[int] = None
+        teacher_tp_size: Optional[int] = None
+        teacher_cp_size: Optional[int] = None
         for entry in teacher_logits:
             if not isinstance(entry, dict):
-                continue
-            entry_world_rank = entry.get("world_rank")
-            available_ranks.append(entry_world_rank)
-            if entry_world_rank == current_world_rank:
-                handles = entry.get("microbatch_handles")
-                assert handles, (
-                    "teacher entry for world_rank="
-                    f"{current_world_rank} has no microbatch_handles"
-                )
-                # Validate required schema-v1 fields on the first per-handle
-                # record (per-handle fields are the authoritative source used
-                # downstream by the student post-processor).
-                first_handle = handles[0]
-                missing = [
-                    f
-                    for f in (
-                        "schema_version",
-                        "world_rank",
-                        "tp_rank",
-                        "cp_rank",
-                        "payload_ipc",
-                    )
-                    if f not in first_handle
-                ]
-                assert not missing, (
-                    f"teacher microbatch handle missing required fields "
-                    f"{missing} (world_rank={current_world_rank})"
-                )
-                return entry
-
-        raise RuntimeError(
-            "No teacher worker result matched current world_rank="
-            f"{current_world_rank}; available teacher world_ranks="
-            f"{available_ranks}. This typically indicates mismatched teacher "
-            "and student worker-group topologies."
-        )
-
-    def _select_teacher_results_for_tp_group(
-        self, teacher_logits: Any
-    ) -> list[dict[str, Any]]:
-        """Return teacher entries for every TP rank sharing (dp, cp, pp) coords.
-
-        Uses the student's TP process group to identify which global ranks are
-        in the same TP shard-set, then pulls one teacher entry per TP rank from
-        the broadcast ``teacher_logits`` list. The returned list is ordered by
-        ``tp_rank`` so consumers can concatenate per-rank local TP vocab shards
-        directly along the vocab dim to reconstruct the full teacher vocab.
-
-        Assumes teacher and student share the same mesh topology (enforced by
-        the strict shard-to-shard matching of the minimal-change IPC plan).
-        """
-        tp_group = self.tp_mesh.get_group()
-        tp_group_ranks = set(torch.distributed.get_process_group_ranks(tp_group))
-
-        matched: dict[int, dict[str, Any]] = {}
-        for entry in teacher_logits:
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("world_rank") not in tp_group_ranks:
                 continue
             handles = entry.get("microbatch_handles")
             if not handles:
                 continue
-            tp_r = handles[0].get("tp_rank")
-            assert tp_r is not None and 0 <= tp_r < self.tp_size, (
-                f"teacher handle has invalid tp_rank={tp_r} (tp_size={self.tp_size})"
-            )
-            assert tp_r not in matched, (
-                f"duplicate teacher entries for tp_rank={tp_r} in my TP group "
-                f"(world_ranks={sorted(tp_group_ranks)})"
-            )
-            matched[tp_r] = entry
+            h0 = handles[0]
+            teacher_dp_size = h0.get("dp_size", entry.get("dp_size"))
+            teacher_tp_size = h0.get("tp_size", entry.get("tp_size"))
+            teacher_cp_size = h0.get("cp_size", entry.get("cp_size"))
+            break
+        assert (
+            teacher_dp_size is not None
+            and teacher_tp_size is not None
+            and teacher_cp_size is not None
+        ), "teacher_logits has no valid entries with parallel-size metadata"
 
-        missing = [r for r in range(self.tp_size) if r not in matched]
-        assert not missing, (
-            f"teacher TP-group incomplete: missing tp_ranks={missing}; "
-            f"tp_group world_ranks={sorted(tp_group_ranks)}; got "
-            f"tp_ranks={sorted(matched.keys())}"
+        # Phase 1 constraint: dp_size must match. Different dp_size requires
+        # batch-index-aware routing because data shards have different sizes.
+        assert teacher_dp_size == self.dp_size, (
+            f"teacher dp_size={teacher_dp_size} != student dp_size="
+            f"{self.dp_size}. Phase 1 of cross-topology IPC requires equal "
+            "dp_size; cross-DP batch routing is not yet implemented. Match "
+            "dp_size in your teacher and student configs."
         )
-        return [matched[r] for r in range(self.tp_size)]
+
+        matched: dict[tuple[int, int], dict[str, Any]] = {}
+        for entry in teacher_logits:
+            if not isinstance(entry, dict):
+                continue
+            handles = entry.get("microbatch_handles")
+            if not handles:
+                continue
+            h0 = handles[0]
+            entry_dp_rank = h0.get("dp_rank", entry.get("dp_rank"))
+            if entry_dp_rank != student_dp_rank:
+                continue
+            t_tp_rank = h0.get("tp_rank")
+            t_cp_rank = h0.get("cp_rank")
+            assert t_tp_rank is not None and 0 <= t_tp_rank < teacher_tp_size, (
+                f"teacher handle has invalid tp_rank={t_tp_rank} "
+                f"(teacher tp_size={teacher_tp_size})"
+            )
+            assert t_cp_rank is not None and 0 <= t_cp_rank < teacher_cp_size, (
+                f"teacher handle has invalid cp_rank={t_cp_rank} "
+                f"(teacher cp_size={teacher_cp_size})"
+            )
+            key = (t_tp_rank, t_cp_rank)
+            assert key not in matched, (
+                f"duplicate teacher entries for (tp_rank, cp_rank)={key} "
+                f"in my dp_rank={student_dp_rank}"
+            )
+            matched[key] = entry
+
+        expected = teacher_tp_size * teacher_cp_size
+        assert len(matched) == expected, (
+            f"teacher DP-group incomplete: got {len(matched)} entries for "
+            f"dp_rank={student_dp_rank}, expected {expected} "
+            f"(teacher tp_size={teacher_tp_size}, cp_size={teacher_cp_size})"
+        )
+        # Validate required per-handle schema fields on a sample entry.
+        sample_handles = next(iter(matched.values()))["microbatch_handles"]
+        first_handle = sample_handles[0]
+        missing = [
+            f
+            for f in (
+                "schema_version",
+                "tp_rank",
+                "tp_size",
+                "cp_rank",
+                "cp_size",
+                "dp_rank",
+                "dp_size",
+                "payload_ipc",
+                "actual_shape",
+            )
+            if f not in first_handle
+        ]
+        assert not missing, (
+            f"teacher microbatch handle missing required schema fields "
+            f"{missing} (dp_rank={student_dp_rank})"
+        )
+        return matched
 
     def _get_or_create_teacher_ipc_post_processor(
         self, topk_logits: Optional[int]
@@ -921,6 +934,12 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             "world_rank": torch.distributed.get_rank(),
             "tp_size": self.tp_size,
             "cp_size": self.cp_size,
+            # dp_size lets the student verify it can match teacher slices by
+            # dp_rank without scanning every per-handle record. pp_size is
+            # always 1 in dtensor v2 (no PP), exposed for forward compat.
+            "dp_size": self.dp_size,
+            "pp_size": 1,
+            "dp_rank": torch.distributed.get_rank(self.dp_mesh.get_group()),
         }
         return self.teacher_logits
 
@@ -956,18 +975,13 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             ctx = nullcontext()
             self.model.train()
 
-        teacher_worker_result = None
-        teacher_worker_tp_group_results = None
+        teacher_dp_group_entries: Optional[dict[tuple[int, int], dict[str, Any]]] = None
         if teacher_logits is not None:
-            teacher_worker_result = self._select_teacher_result_by_world_rank(
+            teacher_dp_group_entries = self._select_teacher_results_for_dp_group(
                 teacher_logits
             )
-            if self.tp_size > 1:
-                teacher_worker_tp_group_results = (
-                    self._select_teacher_results_for_tp_group(teacher_logits)
-                )
 
-        if use_teacher_ipc_loss_postprocessor and teacher_worker_result is not None:
+        if use_teacher_ipc_loss_postprocessor and teacher_dp_group_entries is not None:
             loss_post_processor = XTokenStudentIPCLossPostProcessor(
                 loss_fn=loss_fn,
                 cfg=self.cfg,
@@ -978,8 +992,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 dp_size=self.dp_size,
                 enable_seq_packing=self.enable_seq_packing,
                 sampling_params=None,
-                teacher_result=teacher_worker_result,
-                teacher_tp_group_results=teacher_worker_tp_group_results,
+                teacher_dp_group_entries=teacher_dp_group_entries,
             )
         else:
             loss_post_processor = LossPostProcessor(
