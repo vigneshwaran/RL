@@ -19,7 +19,12 @@ import torch
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import DistributedCrossEntropy
+from nemo_rl.distributed.model_utils import (
+    DistributedCrossEntropy,
+    _compute_distributed_softmax,
+    allgather_cp_sharded_tensor,
+    get_logprobs_from_vocab_parallel_logits,
+)
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -1338,6 +1343,376 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             return kl_per_chunk.sum() / num_valid_chunks
         return torch.tensor(0.0, device=device, requires_grad=True)
 
+    # -------- TP/CP-aware projection (sharded) --------------------------------
+
+    def _project_student_to_teacher_sharded(
+        self,
+        student_logits_local: torch.Tensor,
+        global_top_indices: torch.Tensor,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
+        vocab_parallel_rank: int,
+        device: torch.device,
+        teacher_vocab_size: int,
+        cp_mesh: Any = None,
+        seq_index: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """TP/CP-aware version of :meth:`_project_student_to_teacher`.
+
+        Keeps ``student_logits_local`` in TP+CP-sharded form through softmax
+        and the projection matmul/scatter, so the full ``(B, S, V_s)``
+        tensor is never materialized. After the local projection we
+        TP-all-reduce the partial ``(B, S/CP, K)`` result and CP-all-gather
+        (with de-zigzag) to recover ``(B, S_full, K)``. CP all-gather
+        happens **before** the chunk BMM upstream so cross-CP-rank alignment
+        chunks are handled correctly.
+
+        Either ``tp_group`` or ``cp_group`` may be ``None`` / size 1 — the
+        helper handles the four (TP/CP × on/off) combinations explicitly so
+        the TP-only and CP-only configurations use the right (or trivial)
+        collective. Caller must have validated that *at least one* of them
+        has size > 1 before invoking this method.
+
+        Internally branches on which projection format the ``token_aligner``
+        loaded:
+        - ``sparse_transformation_matrix`` set → COO row-slice + CSR matmul
+          (same math as ``project_token_likelihoods_sparse``).
+        - ``likelihood_projection_indices`` + ``likelihood_projection_matrix``
+          set → row-slice + ``project_token_likelihoods_dense`` scatter
+          (same math as ``project_token_likelihoods_dense``).
+
+        ``learnable`` projection is rejected on either branch because slicing
+        the parameter rows breaks autograd flow back to the original tensor.
+        """
+        if getattr(self.token_aligner, "learnable", False):
+            raise NotImplementedError(
+                "TP/CP-aware projection does not yet support learnable "
+                "projection matrices; row slicing breaks autograd flow back "
+                "to the original parameter. Disable learnable= or fall back "
+                "to the non-sharded path."
+            )
+
+        tp_world = (
+            torch.distributed.get_world_size(tp_group) if tp_group is not None else 1
+        )
+        cp_world = (
+            torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+        )
+
+        V_local = student_logits_local.shape[-1]
+        vocab_start = int(vocab_parallel_rank * V_local)
+        vocab_end = int(vocab_start + V_local)
+
+        # Softmax over the full V_s vocab. With TP > 1 we need the
+        # distributed (max + sum) all-reduce; with TP == 1 the local
+        # softmax is the full-vocab softmax already (every TP rank has the
+        # full V_s on its own).
+        s_logits_T = student_logits_local.to(torch.float32) / self.temperature
+        if tp_world > 1:
+            s_probs = _compute_distributed_softmax(s_logits_T, group=tp_group)
+        else:
+            s_probs = torch.softmax(s_logits_T, dim=-1)
+        # s_probs: (B, S/CP, V_local), normalized over the full V_s.
+
+        sparse_mat = getattr(self.token_aligner, "sparse_transformation_matrix", None)
+        if sparse_mat is not None:
+            partial = self._project_local_sparse(
+                s_probs,
+                sparse_mat,
+                global_top_indices,
+                vocab_start,
+                vocab_end,
+                device,
+            )
+        else:
+            indices = getattr(self.token_aligner, "likelihood_projection_indices", None)
+            values = getattr(self.token_aligner, "likelihood_projection_matrix", None)
+            if indices is None or values is None:
+                raise NotImplementedError(
+                    "TP/CP-aware projection requires either "
+                    "``sparse_transformation_matrix`` (use_sparse_format=True) "
+                    "or both ``likelihood_projection_indices`` and "
+                    "``likelihood_projection_matrix`` (use_sparse_format=False) "
+                    "on the token_aligner."
+                )
+            partial = self._project_local_dense(
+                s_probs,
+                indices,
+                values,
+                global_top_indices,
+                vocab_start,
+                vocab_end,
+                teacher_vocab_size,
+                device,
+            )
+        # partial: (B, S/CP, K) — only this TP rank's V_s/TP rows have
+        # contributed, so it is *partial* in the TP-row sense.
+
+        # TP all-reduce SUM: combine each rank's V_s/TP slice contribution
+        # into the full-vocab projection. Skipped when TP == 1 because the
+        # local projection already covers the full V_s.
+        if tp_world > 1:
+            torch.distributed.all_reduce(
+                partial, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+
+        # CP all-gather: recover full sequence so the downstream chunk BMM
+        # can correctly sum positions of an alignment chunk that spans
+        # CP-rank boundaries. Skipped when CP == 1.
+        #
+        # We use the **DTensor full_tensor** pattern (without an explicit
+        # ``[:, sorted_indices]`` permute) instead of
+        # ``allgather_cp_sharded_tensor`` for two reasons:
+        #
+        #   1. Backward correctness — ``allgather_cp_sharded_tensor.backward``
+        #      runs ``all_reduce(SUM)`` across the CP group; with identical
+        #      downstream loss on all CP ranks (cross-tokenizer KL has
+        #      replicated teacher / mask after gather), this multiplies the
+        #      backward gradient by ``cp_size`` and inflates grad-norm by
+        #      ~cp_size. PyTorch DTensor's shard→replicate backward is
+        #      reduce-scatter, which does not over-count.
+        #
+        #   2. Order consistency with baseline — the legacy non-sharded
+        #      path computes ``student_logits = next_token_logits.full_tensor()``
+        #      and ``_unwrap_dtensor(data["input_ids"]) = .full_tensor()``,
+        #      both of which gather contiguously by CP-rank order (DTensor
+        #      doesn't know nemo_automodel's underlying layout). The
+        #      chunk-mask is built from un-permuted alignment positions but
+        #      operates on these contiguously-gathered tensors. This is
+        #      internally consistent because ``student_logits`` and
+        #      ``input_ids`` end up in the same gather order.
+        #
+        #      ``dtensor_from_parallel_logits_to_logprobs`` (used by the CE
+        #      auxiliary path) does an extra ``[:, sorted_indices]`` un-
+        #      permute because its caller needs original-order logprobs to
+        #      align with original-order ``input_ids[:, 1:]`` targets when
+        #      computing CE outside the function. For projection KL we are
+        #      the ones who own the BMM, and we want to match the legacy
+        #      gather order — so we do **not** apply the permute here.
+        if cp_world > 1 and cp_mesh is not None:
+            from torch.distributed.tensor import DTensor, Shard
+
+            partial_dtensor = DTensor.from_local(partial, cp_mesh, [Shard(1)])
+            partial = partial_dtensor.full_tensor()
+        elif cp_world > 1 and cp_group is not None:
+            # Fallback: legacy ``allgather_cp_sharded_tensor`` path. Only
+            # reached when caller didn't thread ``cp_mesh`` through (e.g.
+            # tests). Note: backward over-counts by cp_size, see (1) above.
+            partial = allgather_cp_sharded_tensor(partial, cp_group, seq_dim=1)
+
+        return partial.to(student_logits_local.dtype)  # (B, S_full, K)
+
+    def _project_local_sparse(
+        self,
+        s_probs: torch.Tensor,
+        sparse_mat: torch.Tensor,
+        global_top_indices: torch.Tensor,
+        vocab_start: int,
+        vocab_end: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Local sparse-matmul branch of ``_project_student_to_teacher_sharded``.
+
+        Slices the COO projection matrix by TP rows + global top-K columns,
+        converts the result to CSR for ``torch.sparse.mm``, and runs the
+        same dense @ sparse.t() trick used in
+        ``project_token_likelihoods_sparse``. Returns ``(B, S/CP, K)`` on
+        the local CP slice.
+        """
+        row_indices = torch.arange(vocab_start, vocab_end, device=device)
+
+        # Slice in COO. Both dim-0 and dim-1 ``index_select`` are supported
+        # on COO and are cheap because COO carries explicit (row, col, val)
+        # triples. When the caller has TP=1 the row slice is a full-rows
+        # copy — correct, just wasted work; kept here for code-path uniformity.
+        proj_local_coo = (
+            sparse_mat.index_select(0, row_indices)
+            .coalesce()
+            .index_select(1, global_top_indices)
+            .coalesce()
+        )
+        proj_local_coo = (
+            proj_local_coo * self.token_aligner.projection_matrix_multiplier
+        )
+        # proj_local_coo: sparse COO (V_local, K)
+
+        B, S_local_cp, V_local = s_probs.shape
+        s_2d_fp32 = s_probs.reshape(B * S_local_cp, V_local).to(torch.float32)
+        proj_local_csr = proj_local_coo.to_sparse_csr().to(torch.float32)
+        # (sparse.t() @ dense.t()).t() = dense @ sparse. proj_local_csr.t()
+        # is ``(K, V_local)``, s_2d.t() is ``(V_local, B*S/CP)``; the result
+        # before the outer ``.t()`` is ``(K, B*S/CP)``.
+        partial_2d = torch.sparse.mm(proj_local_csr.t(), s_2d_fp32.t()).t()
+        # Force contiguous layout: the chained ``.t()`` + ``reshape`` can
+        # leave the result as a non-contiguous view, which NCCL's
+        # ``all_gather`` rejects ("Tensors must be contiguous"). Make it
+        # contiguous up-front so the downstream collectives are safe.
+        return partial_2d.reshape(B, S_local_cp, -1).contiguous()
+
+    def _project_local_dense(
+        self,
+        s_probs: torch.Tensor,
+        projection_indices: torch.Tensor,
+        projection_values: torch.Tensor,
+        global_top_indices: torch.Tensor,
+        vocab_start: int,
+        vocab_end: int,
+        teacher_vocab_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Local dense (CSR-matmul) branch of ``_project_student_to_teacher_sharded``.
+
+        Mirrors the legacy non-sharded path
+        (``_project_student_to_teacher`` with ``use_sparse_format=False``):
+        builds a sparse CSR projection matrix from the row-sliced
+        ``(V_s/TP, top_k)`` indices/values, then ``torch.matmul``-s the
+        student probs into full V_t and slices to global top-K columns.
+
+        We deliberately use the **same CSR matmul implementation as the
+        legacy path** (``project_token_likelihoods_instance(use_sparse_format=False)``
+        on a non-learnable matrix), rather than the optimized
+        ``project_token_likelihoods_dense`` scatter-add path. The two are
+        mathematically equivalent but numerically differ by ~ulp due to
+        different floating-point reduction orders; we pick CSR matmul to
+        keep this sharded path bit-equivalent to baseline at every
+        position so loss / KL match exactly. Memory is acceptable here
+        because the ``(B, S/CP, V_t)`` intermediate before slicing is at
+        most half the legacy ``(B, S, V_t)`` (CP halves the seq dim).
+
+        The downstream TP all-reduce in the caller sums per-rank V_s/TP
+        contributions to recover the full projection. Returns
+        ``(B, S/CP, K)`` on the local CP slice.
+        """
+        # Slice both indices and values to this TP rank's V_s window.
+        # Plain row slicing on a buffer / parameter is cheap and keeps
+        # autograd disconnected (we already rejected ``learnable``).
+        indices_local = projection_indices[vocab_start:vocab_end, :]
+        values_local = projection_values[vocab_start:vocab_end, :]
+
+        # Delegate to the same CSR-matmul implementation the legacy path
+        # uses. The instance method applies ``projection_matrix_multiplier``
+        # internally, so we pass raw ``values_local`` (do not pre-multiply).
+        projected_full_vt = self.token_aligner.project_token_likelihoods_instance(
+            s_probs,
+            indices_local,
+            values_local,
+            int(teacher_vocab_size),
+            device,
+            use_sparse_format=False,
+        )
+        # ``projected_full_vt`` shape: (B, S/CP, V_t). Slice to global top-K
+        # columns to match baseline's order of operations exactly.
+        partial = projected_full_vt[:, :, global_top_indices]
+        # Ensure contiguity for downstream collectives.
+        return partial.contiguous()
+
+    def _projection_kl_tp_cp_aware(
+        self,
+        student_logits_local: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        student_mask: torch.Tensor,
+        teacher_mask: torch.Tensor,
+        teacher_vocab_size: int,
+        device: torch.device,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
+        vocab_parallel_rank: int,
+        cp_mesh: Any = None,
+        seq_index: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Sharded mirror of :meth:`_projection_kl`.
+
+        Numerically equivalent to the full-tensor path; differs only in that
+        the student side is kept TP+CP-sharded through the projection
+        matmul. Teacher side stays full because teacher tensor reconstruction
+        is already done in the IPC post-processor (Phase 1).
+        """
+        # 1. Global teacher-vocab selection (identical to _projection_kl).
+        with torch.no_grad():
+            if self.vocab_topk == 0 or self.vocab_topk >= teacher_vocab_size:
+                global_top_indices = torch.arange(teacher_vocab_size, device=device)
+            else:
+                teacher_flat = teacher_logits.view(-1, teacher_vocab_size)
+                importance = teacher_flat.max(dim=0)[0]
+                _, global_top_indices = torch.topk(
+                    importance,
+                    k=min(self.vocab_topk, teacher_vocab_size),
+                    dim=-1,
+                )
+                global_top_indices = global_top_indices.sort()[0]
+
+        # 2. TP/CP-aware projection (full V_s never materialized).
+        # ``teacher_vocab_size`` is needed by the dense scatter branch to
+        # build the global→reduced index map; the sparse branch ignores it.
+        # ``cp_mesh`` and ``seq_index`` route the CP all-gather through
+        # PyTorch's DTensor full_tensor (correct backward) instead of the
+        # legacy ``allgather_cp_sharded_tensor`` which over-counts grads
+        # by ``cp_size`` on identical-per-CP-rank losses.
+        student_proj = self._project_student_to_teacher_sharded(
+            student_logits_local,
+            global_top_indices,
+            tp_group,
+            cp_group,
+            vocab_parallel_rank,
+            device,
+            teacher_vocab_size,
+            cp_mesh=cp_mesh,
+            seq_index=seq_index,
+        )
+        # student_proj: (B, S_full, K) on every rank
+
+        # 3. Teacher reduce + log-softmax (identical to _projection_kl).
+        teacher_reduced = teacher_logits[:, :, global_top_indices]
+        teacher_log_probs = torch.log_softmax(
+            teacher_reduced / self.temperature, dim=-1
+        )
+        del teacher_reduced
+
+        # 4. Chunk-average via BMM (identical to _projection_kl).
+        student_chunks = torch.bmm(
+            student_mask.transpose(1, 2).to(student_proj.dtype),
+            student_proj,
+        )
+        teacher_chunks = torch.bmm(
+            teacher_mask.transpose(1, 2).to(teacher_log_probs.dtype),
+            teacher_log_probs,
+        )
+        del student_proj, teacher_log_probs
+
+        student_sizes = student_mask.sum(dim=1).unsqueeze(-1).to(student_chunks.dtype)
+        teacher_sizes = teacher_mask.sum(dim=1).unsqueeze(-1).to(teacher_chunks.dtype)
+        student_chunks = student_chunks / (student_sizes + 1e-10)
+        teacher_chunks = teacher_chunks / (teacher_sizes + 1e-10)
+
+        student_chunks = student_chunks / (
+            student_chunks.sum(dim=-1, keepdim=True) + 1e-10
+        )
+        student_log_chunks = torch.log(student_chunks + 1e-10)
+
+        chunk_valid = (student_sizes.squeeze(-1) > 0) & (teacher_sizes.squeeze(-1) > 0)
+
+        # 5. Per-chunk KL scaled by T^2, mean over valid chunks.
+        if self.reverse_kl:
+            kl_elem = torch.nn.functional.kl_div(
+                teacher_chunks,
+                student_log_chunks,
+                reduction="none",
+                log_target=True,
+            )
+        else:
+            kl_elem = torch.nn.functional.kl_div(
+                student_log_chunks,
+                teacher_chunks,
+                reduction="none",
+                log_target=True,
+            )
+        kl_per_chunk = kl_elem.sum(dim=-1) * (self.temperature**2) * chunk_valid
+
+        num_valid_chunks = chunk_valid.sum()
+        if num_valid_chunks > 0:
+            return kl_per_chunk.sum() / num_valid_chunks
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
     # -------- gold-loss path ---------------------------------------------------
 
     def _compute_gold_loss(
@@ -1555,22 +1930,72 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         kl_loss: torch.Tensor,
         student_logits: torch.Tensor,
         input_ids_student: torch.Tensor,
+        *,
+        seq_index: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, float]:
         """Fold a next-token CE term into the KL loss when configured.
 
         - ``dynamic_loss_scaling``: rescale KL to match CE magnitude, then add
           CE (``kl*(ce/kl) + ce``).
         - otherwise: ``kl + ce_loss_scale * ce``.
+
+        Sharded path: when ``student_logits`` is a DTensor (TP and/or CP
+        sharded), we use :func:`get_logprobs_from_vocab_parallel_logits`
+        which dispatches to ``dtensor_from_parallel_logits_to_logprobs``.
+        That helper handles dtensor-v2's ``seq_index``-driven CP layout
+        correctly (the layout is **not** the simple zigzag assumed by the
+        Megatron-style ``from_parallel_logits_to_logprobs``). After
+        receiving full-sequence ``(B, S_full - 1)`` logprobs we mask out
+        ``ignore_index=-100`` positions and take the mean.
+
+        Mathematically equivalent to the legacy ``F.cross_entropy`` path
+        on the materialized full tensor.
+
         Returns ``(loss, ce_value)``; ``ce_value`` is 0.0 when CE is disabled.
         """
         if self.ce_loss_scale <= 0.0 and not self.dynamic_loss_scaling:
             return kl_loss, 0.0
 
-        ce_loss = torch.nn.functional.cross_entropy(
-            student_logits[:, :-1].reshape(-1, student_logits.shape[-1]),
-            input_ids_student[:, 1:].reshape(-1),
-            ignore_index=-100,
-        )
+        is_dtensor = isinstance(student_logits, torch.distributed.tensor.DTensor)
+        if is_dtensor:
+            # ``get_logprobs_from_vocab_parallel_logits`` reads tp_group
+            # from the DTensor's mesh and routes to the dtensor-aware CP
+            # codepath via ``seq_index``. Requires ``input_ids_student``
+            # to be a DTensor so the helper can read its mesh + placements
+            # for CP-aware target re-sharding. Returns ``(B, S_full - 1)``
+            # already correctly shifted and CP-de-permuted.
+            next_token_logprobs = get_logprobs_from_vocab_parallel_logits(
+                student_logits,
+                input_ids_student,
+                seq_index=seq_index,
+            )
+            # For the ignore-mask we need a plain tensor — DTensor masking
+            # would mix DTensor / plain ops downstream. Unwrap if needed.
+            if isinstance(input_ids_student, torch.distributed.tensor.DTensor):
+                input_ids_plain = input_ids_student.full_tensor()
+            else:
+                input_ids_plain = input_ids_student
+            # ``F.cross_entropy`` would compare ``logits[:, :-1]`` with
+            # ``input_ids[:, 1:]``; the helper already shifts target
+            # internally and returns the matching ``(B, S_full - 1)``
+            # window, so the ``[:, 1:]`` slice on ``input_ids`` reproduces
+            # the same alignment for masking.
+            target_shifted = input_ids_plain[:, 1:]
+            max_len = min(target_shifted.shape[1], next_token_logprobs.shape[1])
+            target_shifted = target_shifted[:, :max_len]
+            next_token_logprobs = next_token_logprobs[:, :max_len]
+            mask = (target_shifted != -100).to(next_token_logprobs.dtype)
+            valid_count = mask.sum().clamp(min=1.0)
+            ce_loss = -(next_token_logprobs * mask).sum() / valid_count
+        else:
+            # Legacy non-sharded path. ``student_logits`` is the full
+            # ``(B, S_full, V_s)`` tensor; standard ``F.cross_entropy``
+            # works directly.
+            ce_loss = torch.nn.functional.cross_entropy(
+                student_logits[:, :-1].reshape(-1, student_logits.shape[-1]),
+                input_ids_student[:, 1:].reshape(-1),
+                ignore_index=-100,
+            )
         ce_value = float(ce_loss.item())
         if self.dynamic_loss_scaling and kl_loss.item() > 0:
             dls_scale = ce_loss.item() / kl_loss.item()
@@ -1610,6 +2035,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         mb_idx: Optional[int] = None,
         mbs: Optional[int] = None,
         teacher_topk_indices_ipc: Optional[torch.Tensor] = None,
+        seq_index: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute cross-tokenizer chunk-averaged KL (+ optional CE)."""
 
@@ -1626,6 +2052,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             if isinstance(t, torch.distributed.tensor.DTensor):
                 return t.full_tensor()
             return t
+
+        # Preserve the original (possibly DTensor) input_ids reference for
+        # the CE-auxiliary sharded path. ``dtensor_from_parallel_logits_to_logprobs``
+        # only triggers its CP-aware reshard branch when ``target`` is a
+        # DTensor (so it can read mesh + placements off it); passing the
+        # unwrapped plain tensor causes a target/logits sequence-length
+        # mismatch and a gather size error.
+        input_ids_dtensor = data.get("input_ids")
 
         data = {
             **data,
@@ -1647,12 +2081,82 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 "Call loss_fn.set_cross_tokenizer_data() before training."
             )
 
-        # DTensor unwrap + float32 upcast for numerical stability.
-        student_logits = (
-            next_token_logits.full_tensor()
-            if isinstance(next_token_logits, torch.distributed.tensor.DTensor)
-            else next_token_logits
-        ).to(torch.float32)
+        # Decide whether to use the sharded TP/CP-aware projection path.
+        # MVP scope: requires DTensor logits with non-trivial parallelism, the
+        # sparse transformation matrix, no learnable projection, no CE
+        # auxiliary, and no gold-loss path. Otherwise fall back to the
+        # ``.full_tensor()`` materialization path.
+        is_student_dtensor = isinstance(
+            next_token_logits, torch.distributed.tensor.DTensor
+        )
+        tp_world = (
+            torch.distributed.get_world_size(vocab_parallel_group)
+            if vocab_parallel_group is not None
+            else 1
+        )
+        cp_world = (
+            torch.distributed.get_world_size(context_parallel_group)
+            if context_parallel_group is not None
+            else 1
+        )
+        # Slice 2.1: sharded path accepts both sparse and dense projection
+        # formats. Slice 2.2 (re-enabled): ``_apply_ce_auxiliary`` now uses
+        # the dtensor-aware ``get_logprobs_from_vocab_parallel_logits``
+        # helper which accepts the original DTensor + ``seq_index``, so CE
+        # is correct under dtensor-v2's ``seq_index``-driven CP layout.
+        # Remaining blockers: gold-loss path and learnable projection.
+        has_sparse_proj = (
+            getattr(self.token_aligner, "sparse_transformation_matrix", None)
+            is not None
+        )
+        has_dense_proj = (
+            getattr(self.token_aligner, "likelihood_projection_indices", None)
+            is not None
+            and getattr(self.token_aligner, "likelihood_projection_matrix", None)
+            is not None
+        )
+        has_projection = has_sparse_proj or has_dense_proj
+        use_sharded_path = (
+            is_student_dtensor
+            and (tp_world > 1 or cp_world > 1)
+            and not self.use_gold_loss
+            and has_projection
+            and not getattr(self.token_aligner, "learnable", False)
+        )
+
+        # One-time diagnostic so we can confirm which path runs in a given
+        # training job. Cheap (one bool check per microbatch); the print
+        # itself only fires once per Python process. ``dynamic_scaling``
+        # and ``ce_scale`` are listed as informational — they no longer
+        # gate the sharded path. ``proj_format`` shows which projection
+        # branch ``_project_student_to_teacher_sharded`` will take.
+        if not getattr(self, "_xtoken_dispatch_logged", False):
+            self._xtoken_dispatch_logged = True
+            try:
+                rank = torch.distributed.get_rank()
+            except Exception:
+                rank = -1
+            if has_sparse_proj:
+                proj_format = "sparse"
+            elif has_dense_proj:
+                proj_format = "dense"
+            else:
+                proj_format = "none"
+            print(
+                f"[xtoken-loss dispatch] rank={rank} "
+                f"is_dtensor={is_student_dtensor} tp_world={tp_world} "
+                f"cp_world={cp_world} gold={self.use_gold_loss} "
+                f"dynamic_scaling={self.dynamic_loss_scaling}(info) "
+                f"ce_scale={self.ce_loss_scale}(info) "
+                f"proj_format={proj_format} "
+                f"learnable={getattr(self.token_aligner, 'learnable', False)} "
+                f"=> use_sharded_path={use_sharded_path}",
+                flush=True,
+            )
+
+        # Teacher tensor unwrap is the same for both paths: teacher already
+        # comes in as a full plain tensor from the IPC reconstruction, but
+        # guard against an accidental DTensor on this side too.
         teacher_logits_f32 = (
             teacher_logits.full_tensor()
             if isinstance(teacher_logits, torch.distributed.tensor.DTensor)
@@ -1666,17 +2170,32 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 "(topk_logits=None on the teacher forward pass)."
             )
 
+        # ``student_logits_for_loss`` is the tensor the rest of the function
+        # treats as "student logits". Under the sharded path it stays in
+        # local-shard form ``(B, S/CP, V_s/TP)``; under the legacy path it is
+        # the full ``(B, S_full, V_s)`` tensor.
+        if use_sharded_path:
+            student_logits_for_loss = next_token_logits.to_local().to(torch.float32)
+            student_seq_len = next_token_logits.shape[1]  # full S
+            student_vocab_size = next_token_logits.shape[-1]  # full V_s
+        else:
+            student_logits_for_loss = (
+                next_token_logits.full_tensor()
+                if is_student_dtensor
+                else next_token_logits
+            ).to(torch.float32)
+            student_seq_len = student_logits_for_loss.shape[1]
+            student_vocab_size = student_logits_for_loss.shape[-1]
+
         # --- 1. microbatch slice of aligned pairs ---
         aligned_pairs = self._aligned_pairs
         if mb_idx is not None and mbs is not None:
             aligned_pairs = aligned_pairs[mb_idx * mbs : mb_idx * mbs + batch_size]
 
-        device = student_logits.device
+        device = student_logits_for_loss.device
         self.token_aligner = self.token_aligner.to(device)
 
-        student_seq_len = student_logits.shape[1]
         teacher_seq_len = teacher_logits_f32.shape[1]
-        student_vocab_size = student_logits.shape[-1]
         teacher_vocab_size = teacher_logits_f32.shape[-1]
 
         # --- 2. filter pairs and early-exit if nothing survives ---
@@ -1688,14 +2207,16 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             self.exact_match_only,
         )
         if total_chunks == 0:
-            # Zero loss that is still connected to student_logits via the
+            # Zero loss that is still connected to student logits via the
             # autograd graph. If we returned an unconnected
             # ``torch.tensor(0.0, requires_grad=True)`` instead, the
             # subsequent ``backward()`` on this rank would NOT trigger any
             # DDP all-reduce, while peer ranks with non-zero chunks still
             # do — causing a cross-rank collective mismatch and an NCCL
-            # hang on the very next synchronization.
-            zero_loss = (student_logits.to(torch.float32) * 0.0).sum()
+            # hang on the very next synchronization. Both the sharded
+            # ``to_local()`` path and the materialized ``full_tensor()``
+            # path keep the autograd link back to ``next_token_logits``.
+            zero_loss = (student_logits_for_loss.to(torch.float32) * 0.0).sum()
             # Match the shape of the success-path metrics so downstream
             # microbatch aggregation (which indexes ``loss_metrics[...]``
             # without a default) doesn't KeyError. ``num_valid_samples=0``
@@ -1713,7 +2234,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # --- 3. core KL: gold-loss vs. projection path ---
         if self.use_gold_loss:
             # Gold loss uses the UNFILTERED alignment, capped at
-            # min(S_s, S_t) chunks (matches tokenalign.py exactly).
+            # min(S_s, S_t) chunks (matches tokenalign.py exactly). Gold
+            # loss is not yet TP/CP-aware; the dispatch above ensures we
+            # only get here on the legacy materialized path.
             gold_student_mask, gold_teacher_mask = self._build_chunk_masks(
                 aligned_pairs,
                 batch_size,
@@ -1723,7 +2246,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 device,
             )
             kl_loss, top1_accuracy = self._compute_gold_loss(
-                student_logits,
+                student_logits_for_loss,
                 teacher_logits_f32,
                 gold_student_mask,
                 gold_teacher_mask,
@@ -1740,21 +2263,72 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 total_chunks,
                 device,
             )
-            kl_loss = self._projection_kl(
-                student_logits,
-                teacher_logits_f32,
-                student_mask,
-                teacher_mask,
-                teacher_vocab_size,
-                device,
-            )
+            if use_sharded_path:
+                # Extract CP sub-mesh from the original DTensor so the
+                # projection helper can use ``DTensor.from_local`` for the
+                # CP all-gather (avoids the ``cp_size`` grad over-count of
+                # the legacy ``allgather_cp_sharded_tensor`` path).
+                cp_mesh_for_proj = None
+                if (
+                    cp_world > 1
+                    and is_student_dtensor
+                    and next_token_logits.device_mesh.mesh_dim_names is not None
+                    and "cp" in next_token_logits.device_mesh.mesh_dim_names
+                ):
+                    cp_mesh_for_proj = next_token_logits.device_mesh["cp"]
+                kl_loss = self._projection_kl_tp_cp_aware(
+                    student_logits_for_loss,
+                    teacher_logits_f32,
+                    student_mask,
+                    teacher_mask,
+                    teacher_vocab_size,
+                    device,
+                    tp_group=vocab_parallel_group,
+                    cp_group=context_parallel_group,
+                    vocab_parallel_rank=int(vocab_parallel_rank or 0),
+                    cp_mesh=cp_mesh_for_proj,
+                    seq_index=seq_index,
+                )
+            else:
+                kl_loss = self._projection_kl(
+                    student_logits_for_loss,
+                    teacher_logits_f32,
+                    student_mask,
+                    teacher_mask,
+                    teacher_vocab_size,
+                    device,
+                )
             top1_accuracy = 0.0
 
         # --- 4. optional next-token CE auxiliary ---
+        # Under the sharded path we pass the original ``next_token_logits``
+        # DTensor (not the ``to_local()`` shard used for projection) AND
+        # the DTensor-form ``input_ids`` (saved before the unwrap above):
+        # ``_apply_ce_auxiliary`` uses
+        # ``get_logprobs_from_vocab_parallel_logits`` which inspects the
+        # DTensor mesh and routes via ``dtensor_from_parallel_logits_to_logprobs``.
+        # That helper requires ``target`` to be a DTensor in order to
+        # trigger its CP-aware reshard branch — otherwise target stays at
+        # full-S while logits are at S/CP and ``torch.gather`` blows up
+        # ("Size does not match at dimension 1").
+        # Under the legacy path ``student_logits_for_loss`` is the
+        # materialized full tensor and the helper falls through to
+        # ``F.cross_entropy``.
+        if use_sharded_path:
+            ce_logits = next_token_logits
+            ce_input_ids = (
+                input_ids_dtensor
+                if isinstance(input_ids_dtensor, torch.distributed.tensor.DTensor)
+                else input_ids_student
+            )
+        else:
+            ce_logits = student_logits_for_loss
+            ce_input_ids = input_ids_student
         loss, ce_loss_value = self._apply_ce_auxiliary(
             kl_loss,
-            student_logits,
-            input_ids_student,
+            ce_logits,
+            ce_input_ids,
+            seq_index=seq_index,
         )
 
         # --- 5. DP-aware rescale ---

@@ -1322,16 +1322,45 @@ class XTokenStudentIPCLossPostProcessor(LossPostProcessor):
         self._inject_teacher_ipc_tensors(loss_kwargs)
 
         # Pass parallel groups so TP/CP-aware loss paths
-        # (e.g. CrossTokenizerDistillationLossFn._projection_kl_tp_cp_aware)
-        # can keep student logits sharded through the projection matmul
-        # instead of materializing the full (B, S, V_s) tensor via
-        # ``.full_tensor()``. Loss fns that don't take these kwargs simply
-        # ignore them.
-        if self.tp_size > 1:
-            loss_kwargs.setdefault("vocab_parallel_rank", self.tp_rank)
-            loss_kwargs.setdefault("vocab_parallel_group", self.tp_group)
-        if self.cp_size > 1 and self.cp_group is not None:
+        # (e.g. CrossTokenizerDistillationLossFn._projection_kl_tp_cp_aware
+        # and the sharded CE auxiliary in _apply_ce_auxiliary) can keep
+        # student logits sharded through projection / CE math instead of
+        # materializing the full (B, S, V_s) tensor via ``.full_tensor()``.
+        #
+        # Always pass even when ``tp_size`` or ``cp_size`` is 1 — downstream
+        # helpers (``from_parallel_logits_to_logprobs``,
+        # ``_compute_distributed_softmax``) need a non-None group to call
+        # collective ops, which degenerate to no-ops on size-1 groups. Loss
+        # fns that don't take these kwargs simply ignore them.
+        loss_kwargs.setdefault("vocab_parallel_rank", self.tp_rank)
+        loss_kwargs.setdefault("vocab_parallel_group", self.tp_group)
+        if self.cp_group is not None:
             loss_kwargs.setdefault("context_parallel_group", self.cp_group)
+
+        # Build ``seq_index_tensor`` for the CE-auxiliary sharded path.
+        # ``processed_inputs.seq_index`` is mutated in place by the
+        # nemo_automodel CP framework to record each rank's zigzag position
+        # mapping, so the same DTensor.from_local(... Shard(1)).full_tensor()
+        # pattern that LogprobsPostProcessor uses (see
+        # ``automodel/train.py:LogprobsPostProcessor.compute_logprobs``)
+        # gives the loss fn the permutation it needs to align targets with
+        # logits via ``dtensor_from_parallel_logits_to_logprobs``. Skipped
+        # when CP is off.
+        if (
+            self.cp_size > 1
+            and self.cp_mesh is not None
+            and getattr(processed_inputs, "seq_index", None) is not None
+        ):
+            seq_index_tensor = (
+                DTensor.from_local(
+                    processed_inputs.seq_index,
+                    device_mesh=self.cp_mesh,
+                    placements=[Shard(1)],
+                )
+                .full_tensor()
+                .squeeze(0)
+            )
+            loss_kwargs.setdefault("seq_index", seq_index_tensor)
 
         loss, loss_metrics = loss_fn_(
             logits,

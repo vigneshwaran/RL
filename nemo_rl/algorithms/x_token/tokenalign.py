@@ -407,10 +407,59 @@ class TokenAligner(nn.Module):
                     f"Sparse transformation matrix file not found: {file_path}. Please generate it first."
                 )
 
-            # Load transformation counts dictionary
-            transformation_counts = torch.load(
-                file_path, map_location="cpu", weights_only=False
+            # Load projection data. Two on-disk formats are accepted:
+            #
+            # (a) "Sparse-dict" format — a dict whose keys are
+            #     ``(student_id, teacher_id)`` tuples mapped to weights.
+            #     Historically expected by this branch.
+            #
+            # (b) "Dense-tensor" format — a dict with ``"indices"`` and
+            #     ``"likelihoods"`` 2-D tensors of shape ``(V_s, top_k)``;
+            #     produced by ``minimal_projection_generator.py`` and
+            #     ``minimal_projection_via_multitoken.py``. The two scripts
+            #     in ``nemo_rl/utils/x_token`` only emit (b), so we detect
+            #     and convert to ``transformation_counts`` on the fly.
+            loaded = torch.load(file_path, map_location="cpu", weights_only=False)
+            is_dense_tensor_format = (
+                isinstance(loaded, dict)
+                and "indices" in loaded
+                and "likelihoods" in loaded
+                and torch.is_tensor(loaded["indices"])
             )
+            if is_dense_tensor_format:
+                _dense_indices = loaded["indices"]  # (V_s, top_k) int
+                _dense_likelihoods = loaded["likelihoods"]  # (V_s, top_k) float
+                _V_s, _top_k = _dense_indices.shape
+                # Build COO triples: rows = student id, cols = teacher id from
+                # ``indices``, values = weights from ``likelihoods``. Drop
+                # ``-1`` sentinels which mark "no mapping" rows.
+                _student_rows = (
+                    torch.arange(_V_s, dtype=torch.long)
+                    .unsqueeze(1)
+                    .expand(_V_s, _top_k)
+                    .reshape(-1)
+                )
+                _teacher_cols = _dense_indices.reshape(-1).to(torch.long)
+                _vals = _dense_likelihoods.reshape(-1).to(torch.float32)
+                _valid = _teacher_cols >= 0
+                _student_rows = _student_rows[_valid]
+                _teacher_cols = _teacher_cols[_valid]
+                _vals = _vals[_valid]
+                # Stage as a dict so the rest of the branch can stay
+                # unchanged. Values are kept in pre-multiplier units; the
+                # ``/ self.projection_matrix_multiplier`` divide below
+                # applies the same normalization either way.
+                transformation_counts = {
+                    (int(s.item()), int(t.item())): float(v.item())
+                    for s, t, v in zip(_student_rows, _teacher_cols, _vals)
+                }
+                print(
+                    f"Auto-converted dense-tensor projection file to sparse "
+                    f"transformation_counts: V_s={_V_s}, top_k={_top_k}, "
+                    f"non-zero entries={len(transformation_counts)}"
+                )
+            else:
+                transformation_counts = loaded
 
             # Get tokenizer vocab sizes
             teacher_vocab_size = (
@@ -481,6 +530,15 @@ class TokenAligner(nn.Module):
                     dtype=torch.float32,
                 )
 
+                # ``__init__`` initializes ``self.sparse_transformation_matrix
+                # = None`` as a plain Python attribute, but
+                # ``register_buffer`` rejects names that already exist on
+                # ``self``. Drop the placeholder before re-registering.
+                if "sparse_transformation_matrix" not in self._buffers and hasattr(
+                    self, "sparse_transformation_matrix"
+                ):
+                    del self.sparse_transformation_matrix
+
                 # Optionally make the sparse matrix learnable (values only)
                 if learnable:
                     self.sparse_transformation_matrix = nn.Parameter(
@@ -509,6 +567,12 @@ class TokenAligner(nn.Module):
                     matrix_shape,
                     device=device,
                 )
+
+                # Same placeholder cleanup as the non-empty branch above.
+                if "sparse_transformation_matrix" not in self._buffers and hasattr(
+                    self, "sparse_transformation_matrix"
+                ):
+                    del self.sparse_transformation_matrix
 
                 if learnable:
                     self.sparse_transformation_matrix = nn.Parameter(
